@@ -3,8 +3,9 @@ This module monkey-patches python's (3.x) threading module so that we can find w
 This is useful in our contextualized logging, so that threads inherit logging context from their 'parent'.
 """
 import sys
+from collections import defaultdict
 from importlib import import_module
-from uuid import uuid4
+from typing import NamedTuple, Optional
 from weakref import WeakKeyDictionary
 import time
 import logging
@@ -20,17 +21,56 @@ from easypy._multithreading_init import UUIDS_TREE, IDENT_TO_UUID, UUID_TO_IDENT
 
 
 _REGISTER_GREENLETS = False
+_FRAME_SNAPSHOTS_REGISTRY = defaultdict(dict)
+
 _orig_start_new_thread = _thread.start_new_thread
+
+
+class FrameSnapshot(NamedTuple):
+    f_lineno: int
+    f_code_name: str  # f_code.co_name
+    f_code_filename: str  # f_code.co_filename
+    f_thread_ident: int
+    f_back: Optional["FrameSnapshot"]
+
+    def __repr__(self) -> str:
+        return (
+            f"FrameSnapshot(thread {self.f_thread_ident}, file '{self.f_code_filename}', "
+            f"line {self.f_lineno}, code {self.f_code_name})"
+        )
+
+
+def create_frame_snapshot(frame=None, thread=None) -> FrameSnapshot:
+    if not frame:
+        frame = sys._getframe(0)
+
+    if not thread:
+        thread = threading.current_thread()
+
+    snapshot = FrameSnapshot(
+        f_lineno=frame.f_lineno,
+        f_code_name=frame.f_code.co_name,
+        f_code_filename=frame.f_code.co_filename,
+        f_thread_ident=thread.ident,
+        f_back=create_frame_snapshot(frame.f_back, thread) if frame.f_back else None,
+    )
+    return snapshot
 
 
 def start_new_thread(target, *args, **kwargs):
     """
-    A wrapper for the built in 'start_new_thread' used to capture the parent of each new thread.
+    A wrapper for the built-in 'start_new_thread' used to capture the parent of each new thread.
     """
-    parent_uuid = get_thread_uuid()
+    parent_thread = threading.current_thread()
+    parent_uuid = get_thread_uuid(parent_thread)
+    parent_frame = sys._getframe(0)
 
     def wrapper(*args, **kwargs):
         thread = threading.current_thread()
+
+        _FRAME_SNAPSHOTS_REGISTRY[parent_thread.ident][thread.ident] = (
+            create_frame_snapshot(parent_frame, parent_thread)
+        )
         uuid = get_thread_uuid(thread)
         UUIDS_TREE[uuid] = parent_uuid
         if _REGISTER_GREENLETS:
